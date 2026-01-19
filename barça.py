@@ -1,68 +1,69 @@
 import streamlit as st
 import requests
-import pandas as pd
 import numpy as np
 from scipy.stats import poisson
-import plotly.express as px
+import plotly.graph_objects as go
 
-# Configuración de la página
-st.set_page_config(page_title="Barça Predictor", page_icon="🔵🔴")
-st.title("🔵🔴 FC Barcelona: Predictor Estadístico")
-
+# Configuración técnica
 API_KEY = "9cf1175deaaf48c5b596552f69658d6e"
-HEADERS = {'X-Auth-Token': API_KEY}
 BARCA_ID = 81
+HEADERS = {'X-Auth-Token': API_KEY}
 
 @st.cache_data(ttl=3600)
-def get_data():
-    # Histórico de goles
-    url_hist = f"https://api.football-data.org/v4/teams/{BARCA_ID}/matches?status=FINISHED&limit=20"
-    res_hist = requests.get(url_hist, headers=HEADERS).json()
-    
-    # Próximo partido
-    url_next = f"https://api.football-data.org/v4/teams/{BARCA_ID}/matches?status=SCHEDULED&limit=1"
-    res_next = requests.get(url_next, headers=HEADERS).json()
-    
-    goles_f, goles_c = [], []
-    for m in res_hist['matches']:
-        if m['homeTeam']['id'] == BARCA_ID:
-            goles_f.append(m['score']['fullTime']['home'])
-            goles_c.append(m['score']['fullTime']['away'])
-        else:
-            goles_f.append(m['score']['fullTime']['away'])
-            goles_c.append(m['score']['fullTime']['home'])
-            
-    proximo = res_next['matches'][0] if res_next['matches'] else None
-    return np.mean(goles_f), np.mean(goles_c), proximo
+def cargar_datos_totales():
+    # Clasificación y últimos resultados
+    standings = requests.get("https://api.football-data.org/v4/competitions/PD/standings", headers=HEADERS).json()['standings'][0]['table']
+    history = requests.get(f"https://api.football-data.org/v4/teams/{BARCA_ID}/matches?status=FINISHED&limit=20", headers=HEADERS).json()['matches']
+    next_m = requests.get(f"https://api.football-data.org/v4/teams/{BARCA_ID}/matches?status=SCHEDULED&limit=1", headers=HEADERS).json()['matches'][0]
+    return standings, history, next_m
 
-m_favor, m_contra, proximo = get_data()
+standings, history, next_match = cargar_datos_totales()
 
-# --- INTERFAZ DE USUARIO ---
-col1, col2 = st.columns(2)
-with col1:
-    st.metric("Goles Favor (Media)", f"{m_favor:.2f}")
-with col2:
-    st.metric("Goles Contra (Media)", f"{m_contra:.2f}")
+st.title("🏟️ Predictor: Spotify Camp Nou")
 
-if proximo:
-    rival = proximo['homeTeam']['name'] if proximo['homeTeam']['id'] != BARCA_ID else proximo['awayTeam']['name']
-    st.subheader(f"Próximo Encuentro: vs {rival}")
+# --- INPUTS DE REALISMO ---
+st.sidebar.header("Variables del Partido")
+bajas = st.sidebar.multiselect("Bajas clave del Barça", ["Lewandowski", "Lamine Yamal", "Pedri", "Gavi", "Araujo", "Ter Stegen"])
+cansancio = st.sidebar.checkbox("¿Viene de jugar Champions hace < 4 días?")
+
+# --- CÁLCULO DE FUERZA ---
+goles_ultimos = [m['score']['fullTime']['home'] if m['homeTeam']['id'] == BARCA_ID else m['score']['fullTime']['away'] for m in history]
+fuerza_base = np.mean(goles_ultimos)
+
+# Ajuste por Bajas (-10% por cada jugador clave)
+penalizacion_bajas = 1 - (len(bajas) * 0.10)
+# Ajuste por Cansancio (-5%)
+penalizacion_fisica = 0.95 if cansancio else 1.0
+
+# --- LÓGICA RIVAL ---
+rival = next_match['homeTeam'] if next_match['homeTeam']['id'] != BARCA_ID else next_match['awayTeam']
+es_local = next_match['homeTeam']['id'] == BARCA_ID
+stats_rival = next((t for t in standings if t['team']['id'] == rival['id']), None)
+
+if stats_rival:
+    # Efecto Camp Nou: +25% si es local / -15% si es visitante (desplazamiento)
+    factor_campo = 1.25 if es_local else 0.85
+    defensa_rival_index = (stats_rival['goalsAgainst'] / stats_rival['playedGames']) / 1.3
     
-    # Slider para ajustar la dificultad del rival
-    nivel_rival = st.slider("Nivel defensivo del rival (Goles que suele recibir)", 0.5, 3.0, 1.2)
-    
-    # Cálculo
-    exp_b = (m_favor + nivel_rival) / 2
-    exp_r = m_contra
-    
-    prob_m = np.outer(poisson.pmf(range(6), exp_b), poisson.pmf(range(6), exp_r))
+    # Lambda Final Barça
+    lambda_barca = fuerza_base * factor_campo * penalizacion_bajas * penalizacion_fisica * defensa_rival_index
+    # Lambda Rival (Basado en goles encajados por el Barça: media 0.9)
+    lambda_rival = (stats_rival['goalsFor'] / stats_rival['playedGames']) * 0.9 * (0.8 if es_local else 1.1)
+
+    # --- PREDICCIÓN ---
+    prob_m = np.outer(poisson.pmf(range(7), lambda_barca), poisson.pmf(range(7), lambda_rival))
     vic = np.sum(np.tril(prob_m, -1))
     emp = np.sum(np.diag(prob_m))
     der = np.sum(np.triu(prob_m, 1))
 
-    # Gráfico de tarta
-    fig = px.pie(values=[vic, emp, der], names=['Victoria Barça', 'Empate', 'Derrota'], 
-                 color_discrete_sequence=['#004d98', '#A5A5A5', '#DB0030'])
-    st.plotly_chart(fig)
+    # Interfaz
+    st.header(f"Barça vs {rival['name']}")
+    if es_local: st.success("🏟️ Partido en el Spotify Camp Nou")
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Victoria Barça", f"{vic*100:.1f}%")
+    col2.metric("Empate", f"{emp*100:.1f}%")
+    col3.metric("Victoria Rival", f"{der*100:.1f}%")
 
-    st.write(f"**Marcador más probable:** {np.unravel_index(np.argmax(prob_m), prob_m.shape)[0]} - {np.unravel_index(np.argmax(prob_m), prob_m.shape)[1]}")
+    marcador = np.unravel_index(np.argmax(prob_m), prob_m.shape)
+    st.info(f"📍 Resultado más probable: Barça {marcador[0]} - {marcador[1]} {rival['name']}")
